@@ -1,30 +1,485 @@
 ---
 title: "Analysis"
+knit: (function(input_file, encoding) {
+  out_dir <- 'docs';
+  rmarkdown::render(input_file,
+ encoding=encoding,
+ output_file=file.path(dirname(input_file), out_dir, 'index.html'))})
 author: "Cyril Beyney"
 date: "January 30, 2019"
 output: html_document
 ---
 
+
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-## R Markdown
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+## Overview
+This is the summary report generated as a R Markdown document in RStudio. The goal was to analyze conversion and spend data as part of the Data Science Challenge for Prodigy Game. I used several packages that are listed below for the purpose of this study.
 
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+```{r message=FALSE, warning=FALSE}
+# install.packages(c('car', 'fastDummies', 'gbm', 'ggplot2', 'knitr', 'lubridate', 'MASS', 
+# 'rmarkdown', 'rpart', 'rpart.plot', 'tidyverse'))
+library(car)
+library(fastDummies)
+library(gbm)
+library(ggplot2)
+library(lubridate)
+library(MASS)
+library(plyr)
+library(rpart)
+library(rpart.plot)
+library(tidyverse)
 
-```{r cars}
-summary(cars)
+# Import the data and convert the Date variable into Date type
+data <- read_csv('prodigy-data.csv') %>% mutate(Date = mdy(Date))
+
+colnames(data) <- c("date", "conv_ch1", "conv_ch2", "conv_ch3", "conv_ch4", "conv_ch5", 
+                    "conv_ch6", "conv_org", "spend_ch1", "spend_ch2")
 ```
 
-## Including Plots
 
-You can also embed plots, for example:
 
-```{r pressure, echo=FALSE}
-plot(pressure)
+## 0 - Dataset description
+<b>Dataset above contains daily information about conversions coming from various marketing channels (and organic), as well as daily amount spend (USD) for some of them.</b>
+
+```{r}
+summary(data)
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+Here are a few things we can observe from this summary:
+
+- Daily data are available between April 1st 2016 until November 18th 2017
+- We have 6 marketing channels and 1 organic channel
+- Spend data is available for the first two channels
+- Besides organic conversion, the top 3 channels are 1, 4 and 5 (in that order)
+- The marketing spend is significantly higher for Channel 1 than for Channel 2
+- Beside organic conversion, all data have skewed distribution, as there are a lot of days without any spend and low conversion (observed by the median value of all 6 channels being 0 or close to 0)
+
+The first thing I looked at was outliers, and decided how to deal with them before the forecasting step. I only covered the spend variables as the conversion variables will become my dependent variable. I used the interquartile range (IQR) technique, where data points above the third quartile plus 3 times the IQR, or below the first quartile minus 3 times the IQR, are considered as outliers.
+
+```{r fig.align = "center", fig.width=9 }
+ggplot(data, aes(x = date)) +
+  geom_line(aes(y = spend_ch1, color= "Channel 1"), size = .75) +
+  geom_line(aes(y = spend_ch2, color= "Channel 2"), size = .75) +
+  labs(x = 'Date', y = 'Spend Amount ($)', title = 'Spend Distribution over Time')
+
+# Outliers detection for channel 1 spending
+data %>% 
+  filter(spend_ch1 < quantile(spend_ch1, .25) - 3 * IQR(spend_ch1) | spend_ch1 > quantile(spend_ch1, .75) + 3 * IQR(spend_ch1)) %>%
+  dplyr::select(date, spend_ch1) %>%
+  summary()
+
+# Outliers detection for channel 2 spending
+data %>% 
+  filter(spend_ch2 < quantile(spend_ch2, .25) - 3 * IQR(spend_ch2) | spend_ch2 > quantile(spend_ch2, .75) + 3 * IQR(spend_ch2)) %>%
+  dplyr::select(date, spend_ch2) %>%
+  summary()
+
+```
+
+Most of the data points detected as outliers are data after mid-October 2017, as the spend was higher than before on that period. Those are not outliers per se, so I decided to keep them. Also, more data points with such high spends will be added to the data set for 2017 Q4 in the forecasting part.
+
+
+Next, I wanted to compare the conversion between channels,  so I transformed the data to have 1 variable "channel"and 1 variable "conversion" , and then displayed the results (excluding organic conversion).
+
+```{r fig.align = "center", warning=FALSE}
+# Conversion data manipulation
+data_gathered_conv <- data %>%
+  dplyr::select(-c(spend_ch1, spend_ch2)) %>%
+  gather(key = "channel", value = "conversion", conv_ch1, conv_ch2, conv_ch3, conv_ch4, conv_ch5, conv_ch6, conv_org) %>%
+  mutate(channel = mapvalues(channel, from = c("conv_ch1", "conv_ch2", "conv_ch3", "conv_ch4", "conv_ch5", "conv_ch6", "conv_org"), 
+                             to = c("channel_1", "channel_2", "channel_3", "channel_4", "channel_5", "channel_6", "channel_org")))
+
+# Spend data manipulation
+data_gathered_spend <- data %>%
+  dplyr::select(date, spend_ch1, spend_ch2) %>%
+  gather(key = "channel", value = "spend", spend_ch1, spend_ch2) %>%
+  mutate(channel = mapvalues(channel, from = c("spend_ch1", "spend_ch2"), 
+                             to = c("channel_1", "channel_2")))
+
+# Join both datasets from above into a new one and delete them
+data_gathered <- data_gathered_conv %>%
+  left_join(data_gathered_spend, by= c("date", "channel")) %>%
+  mutate(spend = replace_na(spend, 0)) %>% # will replace NA spends (for channels other than 1 and 2) by 0
+  mutate(channel = as.factor(channel))
+
+rm(data_gathered_conv, data_gathered_spend)
+
+data_gathered
+
+# Outliers removed from the chart for clarity
+ggplot(data_gathered %>% filter(channel != "channel_org"), aes(x = channel, y = conversion)) +
+  geom_boxplot(aes(fill = channel), outlier.shape = NA) + 
+  scale_y_continuous(limits = c(0, 200)) +
+  labs(x = 'Marketing Channels', y = 'Conversion', title = 'Boxplots of the Conversion for each Marketing Channel')
+```
+
+As observed above with the written summary, we can clearly see here that channel 1 has the best conversion among all channels, follwed by channels 4 and 5. The boxplot' shapes also show the skewness towards 0 in each channel.
+
+Now it could be interesting to look at conversion trends over time, so I created a month attribute and plotted the distribution of each channel conversion across all months in the data set.
+
+```{r  fig.width=9, fig.height=9, fig.align = "center"}
+# Create time variables based on the date feature
+data_gathered <- data_gathered %>%
+  mutate(month   = factor(months(date, abbreviate = T), levels = month.abb)) %>%
+  mutate(quarter = factor(quarter(date, with_year = T))) %>%
+  mutate(year    = year(date))
+
+ggplot(data_gathered, aes(x = month, y = conversion)) +
+  geom_boxplot(aes(fill = month)) + 
+  facet_wrap( ~ channel, ncol = 2, scales = "free") +
+  labs(x = 'Months', y = 'Conversion', title = 'Boxplots of the Conversion for each Marketing Channel by Month')
+```
+
+Overall, we observe lowest to no conversion across channels in June/July, while the months of August through November have among the highest conversion rates.
+If this dataset comes from Prodigy conversion data, I would argue that we observe low conversion during the summer break, while the highest conversion rates are observed when classes begin in the fall. 
+Otherwise, there is definitely some seasonality effect in the conversion.
+
+We could also discuss the effectiveness of channel 6 with the lowest numbers of customers coming from it. However, since we only have spend data for channel 1 and 2, an interesting aspect to investigate is the acquisition cost of those 2 channels.
+
+```{r}
+acquisition_cost <- data_gathered %>%
+  filter(channel %in% c("channel_1", "channel_2")) %>%
+  group_by(channel, quarter) %>%
+  dplyr::summarise(all_spend = sum(spend), all_conv = sum(conversion)) %>%
+  mutate(cac = replace_na(all_spend/all_conv, 0)) 
+  
+acquisition_cost
+```
+
+The marketing spend on channel 2 started in the first quarter of 2017 while channel 1 has been going on since the second quarter of 2016.
+For channel 2, the Customer Acquisition Cost (CAC) was quite high in the first two quarters due to really low conversion, but ended being within the same order of magnitude as Channel 1's CAC.
+
+
+## 1 - Conversions forecasting
+<b>Using the dataset above, please forecast total conversions for the months of January, February, and March of 2018, assuming spending trends similar to Q4 of 2017.</b>
+
+Since we are interested in forecasting the total conversion, we need to sum conversions from all channels; this will become our dependent variable. Dates are not appropriate to build model, so I will extract the month and day of week features from them. 
+
+```{r}
+data_model <- data %>%
+  mutate(total_conv_paid  = conv_ch1+conv_ch2) %>%
+  mutate(total_conv_other = conv_ch3+conv_ch4+conv_ch5+conv_ch6+conv_org) %>%
+  dplyr::select(-c(conv_ch1, conv_ch2, conv_ch3, conv_ch4, conv_ch5, conv_ch6, conv_org)) %>%
+  mutate(month = factor(months(date, abbreviate = T), levels = month.abb)) %>%
+  mutate(wday  = factor(wday(date))) %>%
+  mutate(year  = year(date))
+```  
+
+This data set will help train and test the model, but we also need to build the data for 2018 Q1 for the forecast.
+As mentioned in the description of the challenge, we need to assume the same spend trend as for 2017 Q4.
+Looking at the data, we can see that the lastest data point available is November 18th, which requires us to estimate the spend until December 31st for the prediction. 
+
+To do so, I will first infer the spend for the end of November by looking at the trends of October. More precisely, I need to calculate the ratio of spend in the first 18 days between November and October, defined as follow: $$\frac{\sum_{i=1}^{18} spend\_ch1 (November 17)}{\sum_{i=1}^{18} spend\_ch1 (October 17)}$$ Similar ratio is calculated for spend_ch2. Then, I can use those ratios to infer the spend on the remaining days in November by applying it to October 19th through 30th data.
+
+```{r}
+# November estimation
+
+# Ratio calculation for November '17 first 18 days, then October
+tmp_num_spend <- data_model %>% 
+  filter(year == 2017 & month == "Nov") %>% 
+  dplyr::summarise(n1 = sum(spend_ch1), n2 = sum(spend_ch2))
+
+tmp_den_spend <- data_model %>% 
+  filter(date >= ymd("2017-10-01") & date <= ymd("2017-10-18")) %>% 
+  dplyr::summarise(n1 = sum(spend_ch1), n2 = sum(spend_ch2))
+
+ratio_oct_nov_spend1 <- tmp_num_spend$n1 / tmp_den_spend$n1
+ratio_oct_nov_spend2 <- tmp_num_spend$n2 / tmp_den_spend$n2
+
+ratio_oct_nov_spend1
+ratio_oct_nov_spend2
+
+# Estimate remaining days in November by applying the ratios to remaining days in October
+est_data_spend_nov <- data_model %>% 
+  filter(date >= ymd("2017-10-19") & date <= ymd("2017-10-30")) %>%
+  dplyr::select(spend_ch1, spend_ch2) %>%
+  mutate(spend_ch1 = spend_ch1*ratio_oct_nov_spend1) %>%
+  mutate(spend_ch2 = spend_ch2*ratio_oct_nov_spend2)
+
+all_data_spend_nov_17 <-  data_model %>% 
+  filter(year == 2017 & month == "Nov") %>%
+  dplyr::select(spend_ch1, spend_ch2) %>%
+  bind_rows(est_data_spend_nov)
+```
+
+For December, since we have absolutely no spend data for Channel 2, and since the spend on this Channel started in 2017 only, I will first look at the total spend ratio between November and December 2016 defined as follow: $$\frac{\sum_{i=1}^{31} spend\_ch1 (December 16)}{\sum_{j=1}^{30} spend\_ch1 (November 16)}$$ I will apply the same ratio between November and December 2017. Lastly, I will assume that the daily split of spend between Channels 1 and 2 in December 2017 will be the same as in November 2017.
+
+```{r fig.align = "center"}
+# December estimation
+tmp_nov_dec_16_spend <- data_model %>% 
+  filter(year == 2016 & month %in% c("Nov", "Dec")) %>%
+  group_by(month) %>%
+  dplyr::summarise(n = sum(spend_ch1))
+
+# Calculate the ratio of all spend in Channel 1 between November and December
+ratio_nov_dec_16 <- tmp_nov_dec_16_spend %>% filter(month == "Dec") %>% .$n / 
+  tmp_nov_dec_16_spend %>% filter(month == "Nov") %>% .$n
+ratio_nov_dec_16
+
+# 1. We first calculate the total spend per day in December using the ratio from above
+# 2. Then we calculate for each day in November 17 the split between the 2 channels'spend
+# 3. We use this share to infer separately the spend on both channels from the total calculated in 1.
+# This method will only calculate the spend for 30 days in December. 
+# I will assume this to be negligeable, as we will only take 90 days on data from 2017 Q4 
+# (which has 92 days) to populate data for 2018 Q1 (which has 90 days).
+all_data_spend_dec_17 <- all_data_spend_nov_17 %>%
+  mutate(total_spend = (spend_ch1 + spend_ch2)*ratio_nov_dec_16) %>%
+  mutate(ch1_spend_share = spend_ch1 / (spend_ch1+spend_ch2)) %>%
+  mutate(spend_ch1 = total_spend * ch1_spend_share) %>%
+  mutate(spend_ch2 = total_spend - spend_ch1) %>%
+  dplyr::select(spend_ch1,spend_ch2)
+```
+
+Once the remaining days of November '17 and the month of December have been estimated, we can regroup all the data and delete temporary variables used for calculations. I also plotted the spend trend for the whole quarter to verify that it was in sync with existing data (Oct 1st to Nov 18th).
+
+```{r fig.align="center", fig.width=8}
+# Collate all spend data for 2017 Q4
+Q4_2017_spend <- data_model %>% 
+  filter(year == 2017 & month == "Oct") %>%
+  dplyr::select(spend_ch1, spend_ch2) %>%
+  bind_rows(all_data_spend_nov_17) %>%
+  bind_rows(all_data_spend_dec_17) %>%
+  bind_cols(tibble(date = seq(ymd('2017-10-01'),ymd('2017-12-30'),by='days')))
+
+# Delete temporary variables
+rm(tmp_num_spend, tmp_den_spend, ratio_oct_nov_spend1, ratio_oct_nov_spend2, est_data_spend_nov, 
+   all_data_spend_nov_17, tmp_nov_dec_16_spend, ratio_nov_dec_16, all_data_spend_dec_17)
+
+# Here is how the inferred spend for Q4 looks like
+ggplot(Q4_2017_spend, aes(x = date)) +
+  geom_line(aes(y = spend_ch1, color = "Channel 1"), size = .75) +
+  geom_line(aes(y = spend_ch2, color = "Channel 2"), size = .75) +
+  labs(x = 'Date', y = 'Spend Amount ($)', title = 'Spend Distribution over Time (2017 Q4 only)')
+```
+
+Now that we have all the spend data for 2017 Q4, I created the dataset for 2018 Q1 that will be fed to the forecast model to predict the total conversion during that timeframe. As mentioned above, we will take 90 days of spend data out of our estimated spends. Since it does not include December 31st, we are actually taking the spend between October 2nd and December 30th.
+
+```{r}
+date_to_forecast <- tibble(date = seq(ymd('2018-01-01'),ymd('2018-12-31'),by='days'))
+
+# Get the last 90 days of spend in 2017 Q4
+spend_2017Q3 <- data_model %>%
+  top_n(90, date) %>%
+  dplyr::select(spend_ch1, spend_ch2)
+
+# Create 2018 Q1 dataset for the forecast
+data_forecast <- date_to_forecast %>%
+  mutate(month = factor(months(date, abbreviate = T), levels = month.abb)) %>%
+  mutate(wday  = factor(wday(date))) %>%
+  mutate(year  = year(date)) %>%
+  dummy_cols(select_columns = c("month", "wday")) %>% 
+  dplyr::select(-c("month", "wday")) %>%
+  filter(date <= ymd('2018-03-31')) %>%
+  bind_cols(spend_2017Q3)
+
+# Remove unecessary variables and create dummy variables for the month and day of week
+data_model <- data_model %>%
+  dplyr::select(-c(date)) %>%
+  dummy_cols(select_columns = c("month", "wday"), remove_first_dummy = T) %>% 
+  dplyr::select(-c("month", "wday"))
+
+
+# Verify both dataset have the same format
+data_model
+data_forecast
+```
+
+After this estimation phase, we can move on with the creation of the model. In the existing data set, we have two types of daily data: Spend on Channels 1 & 2 and Conversion on Channels 1 through 6, as well as Organic Conversion.
+
+Because we only have spend data on Channels 1 & 2, I will first forecast the conversion on those two channels apart from the others. I will then forecast the conversion on the other channels for which we have limited information.
+
+
+### First part: Conversion Forecast on Channels 1 & 2
+For the first forecast, as we have a few variables for those two channels, including the spend data, I decided to go ahead with a linear regression model. I first started by creating the full model (using all variables), then using stepwise regression I kept only the significant variables in the final model.
+
+Before creating the model, I randonly split the dataset into a training and testing sets (80/20 split).
+
+```{r}
+# Create a random train/test split
+set.seed(24)
+indexSplit <- sample(1:nrow(data_model), nrow(data_model)*.80)
+data_train <- data_model[indexSplit, ]
+data_test <- data_model[-indexSplit,]
+
+# Only consider data on Channels 1 & 2
+data_train_paid <- data_train %>% dplyr::select(-c("total_conv_other", "year"))
+data_test_paid  <- data_test %>% dplyr::select(-c("total_conv_other", "year"))
+
+# Full model (all variables)
+full.model <- lm(total_conv_paid~., data = data_train_paid)
+summary(full.model)
+
+# Adjusted R-square
+summary(full.model)$adj.r.squared
+
+# Check for multicollinearity. Allf VIF values are under 5, indicating  
+# no multicollinearity in the data
+vif(full.model)
+```
+
+The result of the VIF analysis indicates no multicollinearity in the data. The Adjusted $R^2$ value indicates that our model explains ~81.8% of the total variance in the dependent variable.  
+
+```{r}
+# Stepwise regression from full model
+step.model <- stepAIC(full.model, direction = "both",  trace = F)
+summary(step.model)
+
+# Adjusted R-square
+summary(step.model)$adj.r.squared
+
+y_predict <- predict(step.model, data_train_paid)
+test_predict <- predict(step.model, data_test_paid)
+
+# Train Performance
+values.train <- data.frame(obs = data_train_paid$total_conv_paid, pred = y_predict)
+caret::defaultSummary(values.train)
+
+# Test Performance
+values.test <- data.frame(obs = data_test_paid$total_conv_paid, pred = test_predict)
+caret::defaultSummary(values.test)
+```
+
+The stepwise gets rid off of few non-significant variables and gives us a model with an adjusted $R^2$ value of 81.8%. Looking at the performance on the train and test set, we observe a RMSE of 45.3 and 46.5 respectively, which not only is pretty good to predict the conversion on our two paid channels, but also indicates that our model does not overfit by having a performance on the test set comparable to the one on the train set.
+
+
+
+### Second part: Conversion Forecast on Other Channels
+Here, I decided to regroup all other channel conversions into a single metric that I will forecast using decision trees.
+
+```{r fig.height = 7, fig.width = 7, fig.align = "center"}
+# Only consider data for Channels 3 through 6 and Organic conversion
+data_train_other <- data_train %>% dplyr::select(-c("year", "total_conv_paid", "spend_ch1", "spend_ch2"))
+data_test_other  <- data_test %>% dplyr::select(-c("year", "total_conv_paid", "spend_ch1", "spend_ch2"))
+
+# Single regression tree
+fit.tree <- rpart(total_conv_other ~ ., data_train_other)
+rpart.plot(fit.tree)
+train.tree.pred <- predict(fit.tree, data_train_other)
+test.tree.pred  <- predict(fit.tree, data_test_other)
+
+# Train Performance
+tree.train <- data.frame(obs = data_train_other$total_conv_other , pred = train.tree.pred)
+caret::defaultSummary(tree.train)
+
+# Test Performance
+tree.test <- data.frame(obs = data_test_other$total_conv_other , pred = test.tree.pred)
+caret::defaultSummary(tree.test)
+```
+
+As we can see, this regression tree produces high error on both the training and testing set. This is the sign of high bias in our model, one of the reasons being the lack of variables to explain the variance in our dependent variable. As we do not have much more information, I decided to use Boosted Trees to improve this model. Boosting is a method that successively trains trees on the residuals of the previous models to focus on poor forecasted values. In other words, it tries to reduce the bias in our model.
+
+```{r fig.height = 4, fig.width = 4, fig.align = "center"}
+# Boosted Trees to improve the performance of our model.
+set.seed(63)
+fit.boost <- gbm(total_conv_other ~ ., data=data_train_other,distribution = "gaussian",n.trees = 1000,
+    shrinkage = 0.01, interaction.depth = 15)
+summary(fit.boost, plotit = F)
+
+train.boost.pred <- predict(fit.boost, data_train_other, n.trees = 1000)
+test.boost.pred  <- predict(fit.boost, data_test_other, n.trees = 1000)
+
+# Train Performance
+boost.train <- data.frame(obs = data_train_other$total_conv_other , pred = train.boost.pred)
+caret::defaultSummary(boost.train)
+
+# Test Performance
+boost.test <- data.frame(obs = data_test_other$total_conv_other , pred = test.boost.pred)
+caret::defaultSummary(boost.test)
+```
+
+Looking at the relative influence of each variable in the model, we can clearly see that the month of September has a significant higher importance than the others. This also observed in the regression tree where data points in the month of September leads to higher conversion. This oppsite is true for June and July, which lead to lower conversions. If this dataset is indeed from Prodigy marketing campaigns, then there is a potential straighforward explanation: as classes begin in the Fall, more marketing efforts should be in place, and more users sign-ups as part of their math class, teacher recommendation, etc.
+
+While Boosting Trees significantly improved on our regression tree, additional improvements can be made on those predictions. The RMSE is quite high (537 on our test set) due to the lack of additional information on the other marketing channels.
+
+The next step would be to separate organic conversion from the other channels, and create a model just for those conversions. Time series forecast could be a good choice, at organic conversions seem to follow a seasonal trend over time. For the remaining channels 3 through 6, it may be harder to provide a better forecast as long as there is no additional information on those channels.
+
+Using those two models, here is the forecast for 2018 Q1:
+```{r}
+channels12_18Q1 <- predict(step.model, data_forecast)
+otherchann_18Q1 <- predict(fit.boost, data_forecast, n.trees = 1000)
+
+forecast_results <- data_forecast %>%
+  bind_cols(total_conv_paid  = channels12_18Q1) %>%
+  bind_cols(total_conv_other = otherchann_18Q1) %>%
+  mutate(total_conv_all = total_conv_paid + total_conv_other) %>%
+  mutate(month = factor(months(date), levels = month.name)) %>%
+  dplyr::select(year, month, total_conv_paid, total_conv_other, total_conv_all) %>%
+  group_by(month) %>%
+  dplyr::summarise(conv_paid  = sum(total_conv_paid),
+                   conv_other = sum(total_conv_other),
+                   conv_all   = sum(total_conv_all))
+
+forecast_results
+```
+
+If spend on Channels 1 & 2 follow a similar trend as 2017 Q4, then the total conversion would be <b>49,493 in January, 37,726 in February and 44,470 in March 2018</b>.
+
+
+## 2 - “Word of mouth” effect
+<b>Using the dataset above, is it possible to attribute some “word of mouth” effect to any of the channels? What other data would you need to have more confidence?</b>
+
+"Word of mouth" effect should have some conversion in all months, following a similar trend than the organic conversion. Indeed, people convert, and if they like the product they talk to their friends about it, which in turn convert as well around the same time. 
+
+Channel 5 seems to follow a similar monthly pattern as our Organic Conversion data. To have more confidence about this, I would need to know which channel tracks referral conversions (if users can share a referral link to their friends), or wether or not users landed on our website from a link shared by their friends on social media.
+
+
+## 3 - Marketing insights
+<b>Using the dataset above, what kind of insights could you extract to share with the marketing team? </b>
+
+During the exploration of the data, there were a few points that I observed, leading to the following insights:
+
+- Marketing efforts on Channels 2 can be improved. While we have acquisition costs comparable to the ones on Channel 1, it is still on the higher side of the range. As we start to invest more on those channels, it is something to keep in mind.
+
+- The conversion from Channels 3, 5 and 6 are quite low as well. Without more information on those, it is hard to give in-depth insights, however, there is definitely room for improvement on those channels. Allocating a part of the marketing budget to boost conversion could be a good idea. 
+
+- Also, Channel 6, with the lowest conversions, might be worth being reconsidered. Why this particular channel is leading to really poor conversions? Should we re-invest any potential marketing budget into other channels? Having more context regarding this channel may be a priority.
+
+- Organic conversion is highly seasonal, with lowest conversions observed during the summer. If this comes from Prodigy channels, I would suggest to find a way to attract new users even outside of the school year. Organizing special events or contests within the game during that time would help increasing conversion. We could also suggest teachers to communicate with the parents as soon as their kids are enrolled, to showcase the advantages of joining and playing the game before the beginning of the Fall semester.
+
+
+## 4 - Real-time deployment
+<b>Assume that you want to take your model from question 1, and convert it to a real-time model that i) automatically reads data from all the different channels, and ii) displays a dashboard for users where they can see forecasts for different periods of time. How would you architect this solution? What would you do to make it useable by millions of users?</b>
+
+Collecting and analyzing in real-time data from all channels requires a system capable of handling such traffic over time. Therefore, the first thing I would keep in mind is to design a scalable platform that will evolve based on our growth and needs. Amazon Web Services has nice tools to ingest, process, and analyze such amounts of data real-time (such as Firehose, Redshift) .
+
+
+Regarding the ingestion of data from all channels, we need a tool that not only will track the conversion, but also will store the marketing spend on those channels at a granular level (e.g. daily rather than total budget for that channel). Data export from this tool to another storage for processing purpose also needs to be considered. On AWS, data can be pulled from an external source and be stored in a S3 bucket then pushed to a Redshift cluster for data analytics. 
+
+If the company has a Spark cluster, it is also perfectly suited for real-time processing of Big Data. Data can directly be accessed from a S3 bucket, and similarly for the model (if previously stoed on the cloud). I would write a Spark script, either using R or Python, to retrieve the data and the model, process it to respect the formatting needed by the model, run the model on it and output the results into that same S3 bucket. That script can be scheduled to be run every 1-2 minutes to obtain close to real-time results. SPark will handle splitting the data based on the number of processing units in the cluster, process those splits separately and merge the results back together.
+
+I would then create a separate dashboard, either using Tableau or Shiny (R), which would have a live connection to the database/data storage where the outputs of the model are, and could then display the forecast whenever a user logs in. This dashboard and the data would also be duplicated on multiple servers across the world in order to reduce latency when a significant number of users try to access the dashboard at a same time.
+
+Lastly, I would create a scheduled task to automatically upate the model, i.e. use the data newly collected to improve the accuracy of the model. This can be run once a month or less depending on needs and amount of data received since the last update.
+
+
+
+
+## 5 - Google Analytics
+<b>Applying what you know or can learn about Google Analytics, please tell us:
+1. What are its shortcomings (i.e. caveats to be aware of when using it)</b>
+
+While I haven't used Google Analytics in the past, here are the main caveats that I came across while learning about it:
+
+* There is little to no context regarding actions observed. For instance, we may observe low conversion on one channel, or that a page has a high exit rate, but the reasons behind are not explained by the tool. To do so, we need to use external tools to track additional information such as interactions within pages.
+
+* If the free version is used, then we are limited, among other things, in the amount of data collected, as only a sample can be analyzed. This can become an issue if we do not have control over how this sample is created, or if we need more data that what Google provides us.
+
+* The interface can be overwhelming: there are a lot of dashboards, data, and information is sometimes hard to find; getting what we exactly need or knowing where which information is available can be confusing at first.
+
+* All pages we want to track need to run a Javascript code. Therefore, we need to make sure that each page contains the JS script.
+
+* A regular learning of the platform is needed as some updates bring significant changes to the interface,  making it difficult to find what we used to obtain from the tool.
+
+
+<b>2. How you would apply it as part of a pipeline for data science marketing, such as to other questions in this challenge?</b>
+
+As part of a pipeline for data science marketing, I could definitely use it to collect the data needed to create the model from Question 1 (as a matter of fact, I believe this is how the dataset of thos challenge got pulled).
+
+A great feature would be to automate the export of, for instance, spend and conversion data, rather than manually creating an export file. Once the export is automated (e.g. by using the Google Sheet Add-on), we could write a script using the Google API to collect this data from their server and import it directly into a S3 bucket (or any cloud storage service). 
+
+This data would then be directly accessible and refreshed on a regular basis to feed and update the model within the framework discussed in Question 4.
+
