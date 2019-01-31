@@ -481,7 +481,7 @@ While I haven't used Google Analytics in the past, here are the main caveats tha
 
 <b>2. How you would apply it as part of a pipeline for data science marketing, such as to other questions in this challenge?</b>
 
-As part of a pipeline for data science marketing, I could definitely use it to collect the data needed to create the model from Question 1 (as a matter of fact, I believe this is how the dataset of thos challenge got pulled).
+As part of a pipeline for data science marketing, I could definitely use it to collect the data needed to create the model from Question 1 (as a matter of fact, I believe this is how the dataset of this challenge got pulled).
 
 A great feature would be to automate the export of, for instance, spend and conversion data, rather than manually creating an export file. Once the export is automated (e.g. by using the Google Sheet Add-on), we could write a script using the Google API to collect this data from their server and import it directly into a S3 bucket (or any cloud storage service). 
 
