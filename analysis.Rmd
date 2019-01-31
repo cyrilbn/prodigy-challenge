@@ -1,13 +1,17 @@
 ---
-title: "Analysis"
+title: "Prodigy Marketing Data Science Design Challenge"
 knit: (function(input_file, encoding) {
   out_dir <- 'docs';
   rmarkdown::render(input_file,
  encoding=encoding,
  output_file=file.path(dirname(input_file), out_dir, 'index.html'))})
 author: "Cyril Beyney"
-date: "January 30, 2019"
-output: html_document
+date: "January 30th, 2019"
+output:
+  prettydoc::html_pretty: 
+    theme: cayman
+    highlight: vignette
+    toc : TRUE
 ---
 
 
